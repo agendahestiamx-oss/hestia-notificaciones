@@ -1,256 +1,211 @@
 // ─────────────────────────────────────────────────────────────────
-// HESTIA OSM EVAL — Servidor de notificaciones automáticas
-// Node.js + Express · Microsoft 365 SMTP · Render.com
+// HESTIA OSM EVAL — Servidor central
+// Datos compartidos + Notificaciones por correo
+// Node.js + Express · Render.com (free tier)
 // ─────────────────────────────────────────────────────────────────
 const express = require('express');
 const nodemailer = require('nodemailer');
 const cron = require('node-cron');
 const app = express();
+
 app.use(express.json());
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
-// ── CONFIGURACIÓN ──────────────────────────────────────────────────
-const CONFIG = {
-  smtp: {
-    host: 'smtp.office365.com',
-    port: 587,
-    secure: false,
-    auth: {
-      user: process.env.SMTP_USER,      // yaiza@hestiamx.com
-      pass: process.env.SMTP_PASS       // contraseña de aplicación
-    },
-    tls: { ciphers: 'SSLv3', rejectUnauthorized: false }
-  },
-  from: process.env.SMTP_USER,
-  baseUrl: process.env.BASE_URL,        // https://agendahestiamx-oss.github.io/EVALUACIONOSM
-
-  // Destinatarios fijos
-  rh: {
-    nombre: 'Carmen',
-    email: process.env.EMAIL_RH         // carmen@hestiamx.com
-  },
-  contabilidad: {
-    nombre: 'Equipo de Contabilidad',
-    email: process.env.EMAIL_CONT       // contabilidad@hestiamx.com
-  },
-  responsable: {
-    nombre: process.env.NOMBRE_RESP || 'Responsable OSMs',
-    email: process.env.EMAIL_RESP       // tu correo
-  },
-
-  // OSMs registrados (agregar/quitar según el equipo)
-  osms: JSON.parse(process.env.OSMS_JSON || '[]')
-  // Formato: [{"nombre":"Ana García","email":"ana@...","condominios":"Ávida, Indah"},...]
+// ── ALMACENAMIENTO EN MEMORIA ──────────────────────────────────────
+// Guarda sesiones y evaluaciones mientras el servidor está activo
+// (Render free tier duerme después de 15 min de inactividad,
+//  los datos se pierden al despertar — suficiente para uso mensual)
+const store = {
+  sessions: {},    // sessionId -> {osm, mo, admin, condos, notas, created}
+  evalData: {},    // sessionId -> {rh:{}, cont:{}, admin:{}}
+  compromisos: {}  // sessionId -> {osmName, comps, reflexion, mensaje}
 };
 
-// ── TRANSPORTER ────────────────────────────────────────────────────
-const transporter = nodemailer.createTransport(CONFIG.smtp);
+// ── SMTP ────────────────────────────────────────────────────────────
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+const emailRH   = process.env.EMAIL_RH;
+const emailCont = process.env.EMAIL_CONT;
+const emailResp = process.env.EMAIL_RESP;
+const nombreResp= process.env.NOMBRE_RESP || 'Responsable OSMs';
+const baseUrl   = process.env.BASE_URL || 'https://agendahestiamx-oss.github.io/EVALUACIONOSM';
 
-async function sendMail(to, subject, html) {
-  try {
-    await transporter.sendMail({
-      from: `"Hestia Management Co." <${CONFIG.from}>`,
-      to,
-      subject,
-      html
-    });
-    console.log(`✅ Correo enviado a ${to}: ${subject}`);
-    return true;
-  } catch (err) {
-    console.error(`❌ Error enviando a ${to}:`, err.message);
-    return false;
-  }
+let transporter = null;
+if (smtpUser && smtpPass) {
+  transporter = nodemailer.createTransport({
+    host: 'smtp.office365.com', port: 587, secure: false,
+    auth: { user: smtpUser, pass: smtpPass },
+    tls: { ciphers: 'SSLv3', rejectUnauthorized: false }
+  });
 }
 
-// ── TEMPLATES ─────────────────────────────────────────────────────
+async function sendMail(to, subject, html) {
+  if (!transporter) { console.log('SMTP no configurado — correo omitido:', subject); return; }
+  try {
+    await transporter.sendMail({
+      from: `"Hestia Management Co." <${smtpUser}>`, to, subject, html
+    });
+    console.log('✅ Correo enviado a', to);
+  } catch(e) { console.error('❌ Error SMTP:', e.message); }
+}
+
+function emailHtml(body) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+body{font-family:'Segoe UI',Arial,sans-serif;background:#F5F4F0;margin:0;padding:20px}
+.c{max-width:560px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden}
+.h{background:#1C1A17;padding:20px 28px}
+.hb{color:#C4BBA8;font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+.b{padding:28px}
+.b p{font-size:14px;color:#3A3830;line-height:1.7;margin-bottom:12px}
+.btn{display:inline-block;background:#1C1A17;color:#fff!important;text-decoration:none;padding:11px 22px;border-radius:6px;font-size:13px;font-weight:600;margin:14px 0}
+table{width:100%;border-collapse:collapse;margin:14px 0}
+th{background:#F5F4F0;padding:9px 11px;text-align:left;font-size:11px;font-weight:700;color:#6A6860;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #E0DDD5}
+td{padding:9px 11px;font-size:13px;border-bottom:1px solid #E0DDD5}
+.code{font-family:monospace;font-size:15px;font-weight:700;background:#F5F4F0;padding:2px 8px;border-radius:4px;letter-spacing:.1em}
+.f{padding:14px 28px;background:#F5F4F0;font-size:11px;color:#A8A59E;text-align:center}
+</style></head><body><div class="c">
+<div class="h"><div class="hb">Hestia Management Co.</div></div>
+<div class="b">${body}</div>
+<div class="f">Hestia Management Co. · Sistema OSM Eval 360° · Correo automático</div>
+</div></body></html>`;
+}
+
 function mesLabel() {
   return new Date().toLocaleDateString('es-MX', { month: 'long', year: 'numeric' });
 }
 
-function emailBase(contenido) {
-  return `<!DOCTYPE html>
-<html lang="es">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  body{font-family:'Segoe UI',Arial,sans-serif;background:#F5F4F0;margin:0;padding:20px}
-  .container{max-width:580px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08)}
-  .header{background:#1C1A17;padding:24px 32px;display:flex;align-items:center}
-  .header-brand{color:#C4BBA8;font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
-  .body{padding:32px}
-  .body p{font-size:14px;color:#3A3830;line-height:1.7;margin-bottom:14px}
-  .body p:last-child{margin-bottom:0}
-  .btn{display:inline-block;background:#1C1A17;color:#fff!important;text-decoration:none;padding:12px 24px;border-radius:6px;font-size:13px;font-weight:600;margin:16px 0}
-  .footer{padding:16px 32px;background:#F5F4F0;border-top:1px solid #E0DDD5;font-size:11px;color:#A8A59E;text-align:center}
-  table{width:100%;border-collapse:collapse;margin:16px 0}
-  th{background:#F5F4F0;padding:10px 12px;text-align:left;font-size:11px;font-weight:700;color:#6A6860;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #E0DDD5}
-  td{padding:10px 12px;font-size:13px;color:#1C1A17;border-bottom:1px solid #E0DDD5}
-  tr:last-child td{border-bottom:none}
-  .code{font-family:'Courier New',monospace;font-size:15px;font-weight:700;background:#F5F4F0;padding:3px 8px;border-radius:4px;letter-spacing:.1em}
-  .tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
-  .tag-green{background:#E6F4EF;color:#1A7A5E}
-  .tag-amber{background:#FEF3D6;color:#8A5700}
-</style></head>
-<body><div class="container">
-  <div class="header"><div class="header-brand">Hestia Management Co.</div></div>
-  <div class="body">${contenido}</div>
-  <div class="footer">Hestia Management Co. · Sistema OSM Eval 360° · Este es un correo automático.</div>
-</div></body></html>`;
-}
+// ── ENDPOINTS DE DATOS ─────────────────────────────────────────────
 
-// Template 1: Aviso al OSM (día 2 del mes)
-function templateOSM(osm) {
-  const mes = mesLabel();
-  const url = CONFIG.baseUrl + '/OSM_Compromisos.html';
-  return emailBase(`
-    <p>Hola <strong>${osm.nombre}</strong>,</p>
-    <p>La evaluación mensual de <strong>${mes}</strong> ya está disponible. Tu Responsable la está preparando con el equipo y en los próximos días recibirás el resumen de resultados.</p>
-    <p>Cuando recibas el código de sesión, podrás ingresar aquí para ver tu evaluación y definir tus compromisos para el siguiente mes:</p>
-    <a href="${url}" class="btn">Ver mi evaluación →</a>
-    <p style="font-size:12px;color:#A8A59E">Condominios asignados: ${osm.condominios || '—'}</p>
-  `);
-}
-
-// Template 2: Aviso a Carmen y Contabilidad (cuando se crea sesión)
-function templateEvaluadoras(sesiones) {
-  const mes = mesLabel();
-  const evalUrl = CONFIG.baseUrl + '/OSM_Eval_360.html';
-  const filas = sesiones.map(s => `
-    <tr>
-      <td>${s.osm}</td>
-      <td>${s.condominios || '—'}</td>
-      <td><span class="code">${s.codigo}</span></td>
-      <td><a href="${evalUrl}" style="color:#1A7A5E;font-weight:600;text-decoration:none">Evaluar →</a></td>
-    </tr>`).join('');
-
-  return emailBase(`
-    <p>Hola,</p>
-    <p>Se han iniciado las evaluaciones de <strong>${mes}</strong>. A continuación están los OSMs que debes evaluar este mes.</p>
-    <p>Entra al sistema, selecciona tu rol, ingresa el código correspondiente y completa tu sección en ~5 minutos.</p>
-    <table>
-      <thead><tr><th>On Site Manager</th><th>Condominios</th><th>Código</th><th>Acceso</th></tr></thead>
-      <tbody>${filas}</tbody>
-    </table>
-    <a href="${evalUrl}" class="btn">Ir al sistema de evaluación →</a>
-    <p style="font-size:12px;color:#A8A59E">El acceso es con el código de sesión de cada OSM. Si tienes dudas, contacta a ${CONFIG.responsable.nombre}.</p>
-  `);
-}
-
-// Template 3: Aviso a Responsable cuando OSM envía compromisos
-function templateCompromisosRecibidos(osmNombre, condominios) {
-  const url = CONFIG.baseUrl + '/OSM_Eval_360.html';
-  return emailBase(`
-    <p>Hola <strong>${CONFIG.responsable.nombre}</strong>,</p>
-    <p><strong>${osmNombre}</strong> acaba de enviar sus compromisos para el siguiente mes.</p>
-    <p>Entra al dashboard de evaluación para revisar sus compromisos, aprobarlos o ajustarlos, y generar el reporte final.</p>
-    <a href="${url}" class="btn">Ver compromisos y generar reporte →</a>
-    <p style="font-size:12px;color:#A8A59E">Condominios: ${condominios || '—'}</p>
-  `);
-}
-
-// Template 4: Recordatorio si no han evaluado (día 5 del mes)
-function templateRecordatorio(nombre, role) {
-  const url = CONFIG.baseUrl + '/OSM_Eval_360.html';
-  const area = role === 'rh' ? 'Recursos Humanos' : 'Contabilidad';
-  return emailBase(`
-    <p>Hola <strong>${nombre}</strong>,</p>
-    <p>Este es un recordatorio amable: aún tienes evaluaciones pendientes de ${area} para este mes.</p>
-    <p>Tu input es importante para que la Responsable pueda generar el reporte completo. Solo toma ~5 minutos.</p>
-    <a href="${url}" class="btn">Completar mi evaluación →</a>
-  `);
-}
-
-// ── ENDPOINTS ─────────────────────────────────────────────────────
-
-// POST /sesion-iniciada — llamado desde el sistema HTML cuando se crea una sesión
-// Body: { sesiones: [{osm, condominios, codigo}], pendingRoles: ['rh','cont'] }
-app.post('/sesion-iniciada', async (req, res) => {
-  const { sesiones, pendingRoles = ['rh', 'cont'] } = req.body;
-  if (!sesiones || !sesiones.length) return res.status(400).json({ error: 'sesiones requeridas' });
-
-  const results = [];
-
-  // Correo a Carmen y Contabilidad
-  if (pendingRoles.includes('rh') && CONFIG.rh.email) {
-    const sent = await sendMail(
-      CONFIG.rh.email,
-      `📋 Evaluaciones de ${mesLabel()} listas — Hestia OSM Eval`,
-      templateEvaluadoras(sesiones)
-    );
-    results.push({ to: 'rh', sent });
-  }
-  if (pendingRoles.includes('cont') && CONFIG.contabilidad.email) {
-    const sent = await sendMail(
-      CONFIG.contabilidad.email,
-      `📋 Evaluaciones de ${mesLabel()} listas — Hestia OSM Eval`,
-      templateEvaluadoras(sesiones)
-    );
-    results.push({ to: 'cont', sent });
-  }
-
-  res.json({ ok: true, results });
+// Crear o actualizar sesión
+app.post('/session', (req, res) => {
+  const { sessionId, session, evalData } = req.body;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId requerido' });
+  if (session) store.sessions[sessionId] = session;
+  if (evalData) store.evalData[sessionId] = evalData;
+  console.log('Session saved:', sessionId);
+  res.json({ ok: true });
 });
 
-// POST /compromisos-recibidos — llamado desde OSM_Compromisos.html al enviar
-// Body: { osmNombre, condominios }
-app.post('/compromisos-recibidos', async (req, res) => {
-  const { osmNombre, condominios } = req.body;
-  if (!osmNombre) return res.status(400).json({ error: 'osmNombre requerido' });
+// Leer sesión y datos
+app.get('/session/:id', (req, res) => {
+  const id = req.params.id;
+  const session = store.sessions[id];
+  if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
+  res.json({
+    session,
+    evalData: store.evalData[id] || null,
+    compromisos: store.compromisos[id] || null
+  });
+});
 
-  const sent = await sendMail(
-    CONFIG.responsable.email,
-    `✅ ${osmNombre} envió sus compromisos — Hestia OSM Eval`,
-    templateCompromisosRecibidos(osmNombre, condominios)
+// Guardar datos de una evaluadora
+app.post('/eval/:sessionId/:role', (req, res) => {
+  const { sessionId, role } = req.params;
+  if (!['rh','cont','admin'].includes(role)) return res.status(400).json({ error: 'Rol inválido' });
+  if (!store.evalData[sessionId]) store.evalData[sessionId] = { rh:{scores:{},comments:{},openAnswers:{},submitted:false}, cont:{scores:{},comments:{},openAnswers:{},submitted:false}, admin:{scores:{},comments:{},submitted:false} };
+  store.evalData[sessionId][role] = { ...store.evalData[sessionId][role], ...req.body };
+  console.log(`Eval saved: ${sessionId}/${role}`);
+  res.json({ ok: true });
+});
+
+// Leer datos de evaluación
+app.get('/eval/:sessionId', (req, res) => {
+  const data = store.evalData[req.params.sessionId];
+  if (!data) return res.status(404).json({ error: 'No encontrado' });
+  res.json(data);
+});
+
+// Guardar compromisos del OSM
+app.post('/compromisos/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  store.compromisos[sessionId] = req.body;
+  console.log('Compromisos saved:', sessionId);
+  // Notificar a la responsable
+  const osm = req.body.osmName || 'el OSM';
+  const condos = req.body.condominios || '';
+  sendMail(
+    emailResp,
+    `✅ ${osm} envió sus compromisos — Hestia OSM Eval`,
+    emailHtml(`<p>Hola <strong>${nombreResp}</strong>,</p>
+    <p><strong>${osm}</strong> acaba de enviar sus compromisos para el siguiente mes.</p>
+    <p>Entra al sistema para revisarlos y generar el reporte final:</p>
+    <a href="${baseUrl}/OSM_Eval_360.html" class="btn">Ver compromisos →</a>
+    <p style="font-size:12px;color:#A8A59E">Condominios: ${condos}</p>`)
   );
-
-  res.json({ ok: sent });
+  res.json({ ok: true });
 });
 
-// POST /recordatorio — enviar recordatorio manual a quien no ha evaluado
-// Body: { roles: ['rh'] } o { roles: ['cont'] } o { roles: ['rh','cont'] }
-app.post('/recordatorio', async (req, res) => {
-  const { roles = [] } = req.body;
-  const results = [];
-  if (roles.includes('rh') && CONFIG.rh.email) {
-    const sent = await sendMail(CONFIG.rh.email, `⏰ Recordatorio: evaluación pendiente — ${mesLabel()}`, templateRecordatorio(CONFIG.rh.nombre, 'rh'));
-    results.push({ to: 'rh', sent });
-  }
-  if (roles.includes('cont') && CONFIG.contabilidad.email) {
-    const sent = await sendMail(CONFIG.contabilidad.email, `⏰ Recordatorio: evaluación pendiente — ${mesLabel()}`, templateRecordatorio(CONFIG.contabilidad.nombre, 'cont'));
-    results.push({ to: 'cont', sent });
-  }
-  res.json({ ok: true, results });
+// Leer compromisos
+app.get('/compromisos/:sessionId', (req, res) => {
+  const data = store.compromisos[req.params.sessionId];
+  if (!data) return res.status(404).json({ error: 'No encontrado' });
+  res.json(data);
 });
 
-// GET /ping — health check para Render.com
-app.get('/ping', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+// Listar todas las sesiones activas (para admin)
+app.get('/sessions', (req, res) => {
+  const list = Object.entries(store.sessions).map(([id, s]) => ({
+    id, osm: s.osm, mo: s.mo, condos: s.condos,
+    hasRH: !!(store.evalData[id]?.rh?.submitted),
+    hasCont: !!(store.evalData[id]?.cont?.submitted),
+    hasAdmin: !!(store.evalData[id]?.admin?.submitted),
+    hasCompromisos: !!store.compromisos[id]
+  }));
+  res.json(list);
+});
 
-// ── CRON JOBS ─────────────────────────────────────────────────────
+// ── ENDPOINTS DE NOTIFICACIONES ────────────────────────────────────
 
-// Día 2 de cada mes a las 9am — aviso a todos los OSMs
+// Notificar a evaluadoras cuando se crea sesión
+app.post('/notify/sesion', async (req, res) => {
+  const { osm, condos, codigo, mes } = req.body;
+  const evalUrl = baseUrl + '/OSM_Eval_360.html';
+  const body = emailHtml(`
+    <p>Hola,</p>
+    <p>Se ha iniciado la evaluación de <strong>${osm}</strong> para el mes de <strong>${mes || mesLabel()}</strong>.</p>
+    <table>
+      <thead><tr><th>OSM</th><th>Condominios</th><th>Código de sesión</th></tr></thead>
+      <tbody><tr>
+        <td>${osm}</td>
+        <td>${condos || '—'}</td>
+        <td><span class="code">${codigo}</span></td>
+      </tr></tbody>
+    </table>
+    <p>Entra al sistema, selecciona tu rol e ingresa el código:</p>
+    <a href="${evalUrl}" class="btn">Ir a mi evaluación →</a>
+    <p style="font-size:12px;color:#A8A59E">Toma aproximadamente 5 minutos. Gracias por tu apoyo.</p>`);
+
+  if (emailRH)   await sendMail(emailRH,   `📋 Evaluación de ${osm} lista — Hestia OSM Eval`, body);
+  if (emailCont) await sendMail(emailCont, `📋 Evaluación de ${osm} lista — Hestia OSM Eval`, body);
+  res.json({ ok: true });
+});
+
+// Health check
+app.get('/ping', (req, res) => res.json({ ok: true, sessions: Object.keys(store.sessions).length, time: new Date().toISOString() }));
+
+// ── CRON: Recordatorio día 2 de cada mes ──────────────────────────
 cron.schedule('0 9 2 * *', async () => {
-  console.log('🔔 Cron: enviando avisos del día 2 a OSMs...');
-  for (const osm of CONFIG.osms) {
-    if (osm.email) {
-      await sendMail(
-        osm.email,
-        `📅 Evaluación de ${mesLabel()} — Hestia OSM Eval`,
-        templateOSM(osm)
-      );
-    }
-  }
-}, { timezone: 'America/Mexico_City' });
-
-// Día 5 de cada mes a las 10am — recordatorio si no han evaluado
-cron.schedule('0 10 5 * *', async () => {
-  console.log('🔔 Cron: enviando recordatorios del día 5...');
-  // El recordatorio siempre se manda — el sistema HTML ya sabe quién completó
-  await sendMail(CONFIG.rh.email, `⏰ Recordatorio evaluación ${mesLabel()}`, templateRecordatorio(CONFIG.rh.nombre, 'rh'));
-  await sendMail(CONFIG.contabilidad.email, `⏰ Recordatorio evaluación ${mesLabel()}`, templateRecordatorio(CONFIG.contabilidad.nombre, 'cont'));
+  console.log('Cron: recordatorio mensual');
+  await sendMail(
+    emailResp,
+    `📅 Recordatorio: abrir evaluaciones OSM — ${mesLabel()}`,
+    emailHtml(`<p>Hola <strong>${nombreResp}</strong>,</p>
+    <p>Es día 2 del mes — momento de abrir las evaluaciones 360° de los On Site Managers.</p>
+    <a href="${baseUrl}/OSM_Eval_360.html" class="btn">Abrir sistema de evaluación →</a>
+    <p style="font-size:12px;color:#A8A59E">Al crear cada sesión, Carmen y Contabilidad recibirán automáticamente su correo con el código.</p>`)
+  );
 }, { timezone: 'America/Mexico_City' });
 
 // ── START ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor de notificaciones Hestia corriendo en puerto ${PORT}`);
-  console.log(`📧 SMTP: ${CONFIG.smtp.auth.user || 'NO CONFIGURADO'}`);
-  console.log(`👥 OSMs configurados: ${CONFIG.osms.length}`);
+  console.log(`🚀 Hestia OSM Server corriendo en puerto ${PORT}`);
+  console.log(`📧 SMTP: ${smtpUser || 'NO CONFIGURADO'}`);
 });
