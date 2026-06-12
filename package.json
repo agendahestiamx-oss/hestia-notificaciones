@@ -1,14 +1,12 @@
 {
   "name": "hestia-notificaciones",
-  "version": "2.0.0",
-  "description": "Servidor de evaluaciones OSM - Hestia Management Co.",
+  "version": "2.1.0",
+  "description": "Servidor OSM Eval 360 — Hestia Management Co.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "nodemailer": "^6.9.7"

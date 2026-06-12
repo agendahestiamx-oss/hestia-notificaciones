@@ -1,170 +1,152 @@
-const express  = require('express');
-const cors     = require('cors');
-const https    = require('https');
-const Database = require('better-sqlite3');
-const path     = require('path');
+const express = require('express');
+const cors    = require('cors');
+const https   = require('https');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
-// ── DB ────────────────────────────────────────────────────────────
-const DB_PATH = process.env.DB_PATH || '/tmp/hestia_osm.db';
-const db = new Database(DB_PATH);
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    id      TEXT PRIMARY KEY,
-    data    TEXT NOT NULL,
-    updated INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-  );
-  CREATE TABLE IF NOT EXISTS evals (
-    session_id TEXT NOT NULL,
-    role       TEXT NOT NULL,
-    data       TEXT NOT NULL,
-    submitted  INTEGER NOT NULL DEFAULT 0,
-    updated    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    PRIMARY KEY (session_id, role)
-  );
-`);
+// ── IN-MEMORY STORE ───────────────────────────────────────────────
+// Persiste mientras el servidor esté vivo.
+// Para persistencia entre reinicios, agregar SQLite después.
+const sessions = {}; // { id: { session, evalData } }
+
 const now = () => Math.floor(Date.now() / 1000);
 
 // ── HEALTH ────────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => res.json({ ok: true, sessions: Object.keys(sessions).length }));
 
 // ── SESSION UPSERT ────────────────────────────────────────────────
 app.post('/session', (req, res) => {
   try {
     const { sessionId, session, evalData } = req.body;
     if (!sessionId || !session) return res.status(400).json({ error: 'Missing fields' });
-
-    db.prepare(`INSERT INTO sessions (id,data,updated) VALUES (?,?,?)
-      ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated=excluded.updated`)
-      .run(sessionId, JSON.stringify(session), now());
-
-    if (evalData) {
-      for (const role of ['rh','cont','admin']) {
-        if (!evalData[role]) continue;
-        db.prepare(`INSERT INTO evals (session_id,role,data,submitted,updated) VALUES (?,?,?,?,?)
-          ON CONFLICT(session_id,role) DO UPDATE SET data=excluded.data,submitted=excluded.submitted,updated=excluded.updated`)
-          .run(sessionId, role, JSON.stringify(evalData[role]), evalData[role].submitted ? 1 : 0, now());
+    if (!sessions[sessionId]) sessions[sessionId] = { session, evalData: evalData||{}, updated: now() };
+    else {
+      sessions[sessionId].session = session;
+      sessions[sessionId].updated = now();
+      if (evalData) {
+        for (const role of ['rh','cont','admin']) {
+          if (!evalData[role]) continue;
+          const rem = evalData[role];
+          const loc = sessions[sessionId].evalData[role];
+          const remHas = rem.scores && Object.keys(rem.scores).length > 0;
+          const locHas = loc && loc.scores && Object.keys(loc.scores).length > 0;
+          if (remHas || !locHas) {
+            sessions[sessionId].evalData[role] = {
+              ...rem,
+              scores: { ...(locHas ? loc.scores : {}), ...rem.scores },
+              comments: { ...(loc&&loc.comments||{}), ...(rem.comments||{}) },
+              oqAnswers: { ...(loc&&loc.oqAnswers||{}), ...(rem.oqAnswers||{}) },
+              submitted: rem.submitted || (loc&&loc.submitted) || false
+            };
+          }
+        }
       }
     }
+    console.log('Session saved:', sessionId);
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── SESSION GET ───────────────────────────────────────────────────
 app.get('/session/:id', (req, res) => {
-  try {
-    const row = db.prepare('SELECT data FROM sessions WHERE id=?').get(req.params.id);
-    if (!row) return res.json({ session: null, evalData: null });
-    const session  = JSON.parse(row.data);
-    const evalRows = db.prepare('SELECT role,data FROM evals WHERE session_id=?').all(req.params.id);
-    const evalData = { rh:null, cont:null, admin:null };
-    for (const er of evalRows) evalData[er.role] = JSON.parse(er.data);
-    res.json({ session, evalData });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  const s = sessions[req.params.id];
+  if (!s) return res.json({ session: null, evalData: null });
+  res.json({ session: s.session, evalData: s.evalData });
 });
 
 // ── EVAL ROLE UPSERT ──────────────────────────────────────────────
 app.post('/eval/:sessionId/:role', (req, res) => {
   try {
     const { sessionId, role } = req.params;
-    db.prepare(`INSERT INTO evals (session_id,role,data,submitted,updated) VALUES (?,?,?,?,?)
-      ON CONFLICT(session_id,role) DO UPDATE SET data=excluded.data,submitted=excluded.submitted,updated=excluded.updated`)
-      .run(sessionId, role, JSON.stringify(req.body), req.body.submitted ? 1 : 0, now());
+    if (!sessions[sessionId]) return res.status(404).json({ error: 'Session not found' });
+    if (!sessions[sessionId].evalData) sessions[sessionId].evalData = {};
+    const existing = sessions[sessionId].evalData[role] || {};
+    sessions[sessionId].evalData[role] = {
+      ...existing,
+      ...req.body,
+      scores: { ...(existing.scores||{}), ...(req.body.scores||{}) },
+      comments: { ...(existing.comments||{}), ...(req.body.comments||{}) },
+      oqAnswers: { ...(existing.oqAnswers||{}), ...(req.body.oqAnswers||{}) },
+    };
+    sessions[sessionId].updated = now();
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── SESSIONS LIST ─────────────────────────────────────────────────
 app.get('/sessions', (req, res) => {
-  try {
-    const rows = db.prepare(
-      `SELECT id, json_extract(data,'$.osm') as osm, json_extract(data,'$.mo') as mo, updated
-       FROM sessions ORDER BY updated DESC LIMIT 100`
-    ).all();
-    res.json(rows);
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  const rows = Object.entries(sessions)
+    .map(([id, s]) => ({
+      id,
+      osm: s.session && s.session.osm,
+      mo:  s.session && s.session.mo,
+      updated: s.updated || now()
+    }))
+    .sort((a, b) => b.updated - a.updated)
+    .slice(0, 100);
+  res.json(rows);
 });
 
 // ── SESSION DELETE ────────────────────────────────────────────────
 app.delete('/session/:id', (req, res) => {
-  try {
-    db.prepare('DELETE FROM evals WHERE session_id=?').run(req.params.id);
-    db.prepare('DELETE FROM sessions WHERE id=?').run(req.params.id);
+  if (sessions[req.params.id]) {
+    delete sessions[req.params.id];
     res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } else {
+    res.status(404).json({ error: 'Session not found' });
+  }
 });
 
-// ── NOTIFY (correos) ──────────────────────────────────────────────
-// Usa nodemailer si tienes SMTP configurado, si no solo loguea
+// ── NOTIFY ────────────────────────────────────────────────────────
 app.post('/notify/sesion', (req, res) => {
   const { osm, condos, codigo, mes, emails } = req.body;
-  console.log(`[NOTIFY] Nueva sesión: ${osm} (${mes}) — Código: ${codigo}`);
-
   const SMTP_USER = process.env.SMTP_USER;
   const SMTP_PASS = process.env.SMTP_PASS;
-  const EMAIL_RH   = process.env.EMAIL_RH   || (emails && emails.rh);
-  const EMAIL_CONT = process.env.EMAIL_CONT  || (emails && emails.cont);
+  const emailRH   = (emails && emails.rh)   || process.env.EMAIL_RH;
+  const emailCont = (emails && emails.cont)  || process.env.EMAIL_CONT;
 
   if (!SMTP_USER || !SMTP_PASS) {
-    console.log('[NOTIFY] SMTP no configurado — correos no enviados');
-    return res.json({ ok: true, sent: false, reason: 'smtp_not_configured' });
+    console.log('SMTP no configurado — correo omitido: 📋 Evaluación de', osm, '— Hestia OSM Eval');
+    return res.json({ ok: true, sent: false });
   }
 
-  // Send emails via nodemailer
   const nodemailer = require('nodemailer');
   const transporter = nodemailer.createTransport({
-    host: 'smtp.office365.com',
-    port: 587,
-    secure: false,
+    host: 'smtp.office365.com', port: 587, secure: false,
     auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
+  const subject = 'Evaluación OSM — ' + osm + ' · ' + mes + ' · Código: ' + codigo;
+  const text = [
+    'Hola,',
+    '',
+    'Se ha iniciado la evaluación mensual 360° para:',
+    '  • Colaborador: ' + osm,
+    '  • Condominios: ' + condos,
+    '  • Período: ' + mes,
+    '  • Código de sesión: ' + codigo,
+    '',
+    'Ingresa al link y usa el código:',
+    'https://agendahestiamx-oss.github.io/EVALUACIONOSM/OSM_Eval_360.html',
+    '',
+    'Gracias,',
+    'Hestia Management Co.'
+  ].join('\n');
 
-  const subject = `Evaluación OSM — ${osm} · ${mes} · Código: ${codigo}`;
-  const body = `
-Hola,
-
-Se ha iniciado la evaluación mensual 360° para el siguiente On Site Manager:
-
-• Colaborador: ${osm}
-• Condominios: ${condos}
-• Período: ${mes}
-• Código de sesión: ${codigo}
-
-Para completar tu evaluación, ingresa al siguiente link y usa el código indicado:
-https://agendahestiamx-oss.github.io/EVALUACIONOSM/OSM_Eval_360.html
-
-El código que necesitas es: ${codigo}
-
-Gracias por tu tiempo.
-Hestia Management Co.
-  `.trim();
-
-  const targets = [EMAIL_RH, EMAIL_CONT].filter(Boolean);
-  Promise.all(targets.map(to =>
-    transporter.sendMail({ from: SMTP_USER, to, subject, text: body })
-  )).then(() => {
-    console.log(`[NOTIFY] Correos enviados a: ${targets.join(', ')}`);
-    res.json({ ok: true, sent: true, to: targets });
-  }).catch(e => {
-    console.error('[NOTIFY] Error enviando correo:', e.message);
-    res.json({ ok: true, sent: false, reason: e.message });
-  });
+  const targets = [emailRH, emailCont].filter(Boolean);
+  Promise.all(targets.map(to => transporter.sendMail({ from: SMTP_USER, to, subject, text })))
+    .then(() => res.json({ ok: true, sent: true, to: targets }))
+    .catch(e => { console.error('Email error:', e.message); res.json({ ok: true, sent: false }); });
 });
 
 // ── AI PROXY ──────────────────────────────────────────────────────
-// Recibe el prompt desde el HTML y llama a Anthropic server-side
-// Evita el error CORS de llamar a api.anthropic.com desde el browser
 app.post('/ai/report', (req, res) => {
   const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'No prompt' });
 
   const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-  if (!ANTHROPIC_KEY) {
-    return res.status(503).json({ error: 'API key no configurada en el servidor' });
-  }
+  if (!ANTHROPIC_KEY) return res.status(503).json({ error: 'ANTHROPIC_API_KEY no configurada en el servidor' });
 
   const body = JSON.stringify({
     model: 'claude-sonnet-4-20250514',
@@ -188,15 +170,10 @@ app.post('/ai/report', (req, res) => {
     let data = '';
     apiRes.on('data', chunk => data += chunk);
     apiRes.on('end', () => {
-      try {
-        const parsed = JSON.parse(data);
-        res.json(parsed);
-      } catch(e) {
-        res.status(500).json({ error: 'Invalid response from AI' });
-      }
+      try { res.json(JSON.parse(data)); }
+      catch(e) { res.status(500).json({ error: 'Invalid AI response' }); }
     });
   });
-
   apiReq.on('error', e => res.status(500).json({ error: e.message }));
   apiReq.write(body);
   apiReq.end();
@@ -204,4 +181,8 @@ app.post('/ai/report', (req, res) => {
 
 // ── START ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Hestia OSM server :${PORT} — DB: ${DB_PATH}`));
+app.listen(PORT, () => {
+  console.log('🚀 Hestia OSM Server corriendo en puerto', PORT);
+  console.log(process.env.SMTP_USER ? '📧 SMTP: CONFIGURADO' : '📵 SMTP: NO CONFIGURADO');
+  console.log(process.env.ANTHROPIC_API_KEY ? '🤖 AI: CONFIGURADO' : '🤖 AI: NO CONFIGURADO (agrega ANTHROPIC_API_KEY)');
+});
